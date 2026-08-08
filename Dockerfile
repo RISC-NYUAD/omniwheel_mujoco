@@ -6,7 +6,7 @@ ENV CYCLONEDDS_URI=file:///workspace/omniwheel_mujoco/cyclonedds.xml
 
 RUN apt update && apt upgrade -y
 
-RUN apt install -y \
+RUN apt-get update && apt install -y \
     ros-humble-desktop \
     ros-humble-rmw-cyclonedds-cpp \
     ros-humble-robot-state-publisher \

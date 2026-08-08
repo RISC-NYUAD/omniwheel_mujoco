@@ -1,0 +1,13 @@
+scene_file: "/workspace/omniwheel_mujoco/mujoco/scene_static.xml"
+fixed_pendulum: true
+
+publish_rate_hz: 100.0
+command_timeout_sec: 0.2
+
+# Per-wheel torque saturation after /omni/cmd_wrench is converted to motor torques.
+torque_limit_nm: 4.7
+
+# Encoder-like quantization for wheel joint positions.
+encoder_ticks_per_rev: 4096
+
+print_scene_information: true

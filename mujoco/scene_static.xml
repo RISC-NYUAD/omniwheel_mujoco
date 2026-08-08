@@ -1,0 +1,25 @@
+<?xml version="1.0"?>
+<mujoco model="omni_pendulum_scene_static">
+  <include file="omni_pendulum.xml" />
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="RK4" />
+  <statistic center="0 0 0.35" extent="2.0" />
+  <visual>
+    <headlight ambient="0.25 0.25 0.25" diffuse="0.55 0.55 0.55" specular="0.15 0.15 0.15" />
+    <rgba haze="0.75 0.82 0.9 1" />
+    <global azimuth="135" elevation="-20" />
+  </visual>
+  <asset>
+    <texture name="skybox" type="skybox" builtin="gradient" rgb1="0.74 0.82 0.92" rgb2="0.18 0.22 0.28" width="512" height="3072" />
+    <texture name="ground_grid" type="2d" builtin="checker" rgb1="0.24 0.25 0.26" rgb2="0.31 0.33 0.35" width="512" height="512" mark="edge" markrgb="0.1 0.1 0.1" />
+    <material name="ground" texture="ground_grid" texuniform="true" texrepeat="8 8" reflectance="0.15" />
+  </asset>
+  <worldbody>
+    <light name="key_light" pos="0 -3 4" dir="0 0.7 -1" directional="true" diffuse="0.8 0.8 0.75" specular="0.2 0.2 0.2" />
+    <light name="fill_light" pos="-3 2 3" dir="0.7 -0.4 -1" directional="true" diffuse="0.25 0.28 0.32" specular="0 0 0" />
+    <geom name="ground" type="plane" size="5 5 0.05" material="ground" friction="1.5 0.1 0.01" contype="2" conaffinity="1" />
+    <camera name="overview" pos="1.5 -1.8 1.1" xyaxes="0.768 0.64 0 -0.32 0.384 0.866" />
+  </worldbody>
+  <equality>
+    <weld name="fixed_pendulum" body1="base_link" body2="pendulum_link1" />
+  </equality>
+</mujoco>

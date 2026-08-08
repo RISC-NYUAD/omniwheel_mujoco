@@ -72,8 +72,8 @@ struct SimulationConfig {
   double publish_rate_hz{100.0};
   double command_timeout_sec{0.2};
   double torque_limit_nm{4.7};
-  double motor_time_constant_sec{0.05};
   int encoder_ticks_per_rev{4096};
+  bool fixed_pendulum{false};
   bool print_scene_information{true};
 };
 
@@ -211,11 +211,11 @@ void loadConfig(const std::filesystem::path& config_file) {
   if (cfg["torque_limit_nm"]) {
     g_config.torque_limit_nm = cfg["torque_limit_nm"].as<double>();
   }
-  if (cfg["motor_time_constant_sec"]) {
-    g_config.motor_time_constant_sec = cfg["motor_time_constant_sec"].as<double>();
-  }
   if (cfg["encoder_ticks_per_rev"]) {
     g_config.encoder_ticks_per_rev = cfg["encoder_ticks_per_rev"].as<int>();
+  }
+  if (cfg["fixed_pendulum"]) {
+    g_config.fixed_pendulum = cfg["fixed_pendulum"].as<bool>();
   }
   if (cfg["print_scene_information"]) {
     g_config.print_scene_information = cfg["print_scene_information"].as<bool>();
@@ -237,10 +237,10 @@ double clamp(double value, double low, double high) {
   return std::min(std::max(value, low), high);
 }
 
-std::array<double, 3> baseWrenchToMotorTorquesRightLeftBack(double force_x, double force_y,
+std::array<double, 3> baseWrenchToMotorTorquesLeftRightBack(double force_x, double force_y,
                                                             double torque_z) {
   // Closed form of omni_motor_bulkctrl_torque.cpp's J_torque matrix.
-  // Output order is real motor order: Wheel_1/right, Wheel_2/left, Wheel_3/back.
+  // Output order is XML actuator order: rim_left_motor, rim_right_motor, rim_back_motor.
   constexpr double wheel_radius_m = 0.101;
   constexpr double base_radius_m = 0.1285;
   const double torque_z_coeff = wheel_radius_m / (3.0 * base_radius_m);
@@ -338,10 +338,8 @@ class OmniwheelRosBridge : public rclcpp::Node {
     wrench_sub_ = create_subscription<geometry_msgs::msg::Wrench>(
         "/omni/cmd_wrench", rclcpp::QoS(10),
         [this](const geometry_msgs::msg::Wrench::SharedPtr msg) {
-          const auto motor_torque_rlb =
-              baseWrenchToMotorTorquesRightLeftBack(msg->force.x, msg->force.y, msg->torque.z);
-          const std::array<double, 3> motor_torque_lrb = {
-              motor_torque_rlb[1], motor_torque_rlb[0], motor_torque_rlb[2]};
+          const auto motor_torque_lrb =
+              baseWrenchToMotorTorquesLeftRightBack(msg->force.x, msg->force.y, msg->torque.z);
 
           std::lock_guard<std::mutex> lock(command_mutex_);
           for (std::size_t i = 0; i < 3; ++i) {
@@ -385,13 +383,44 @@ class OmniwheelRosBridge : public rclcpp::Node {
       }
     }
 
-    const double dt = std::max(1e-6, model->opt.timestep);
-    const double alpha = clamp(dt / std::max(1e-6, g_config.motor_time_constant_sec), 0.0, 1.0);
     for (std::size_t i = 0; i < 3; ++i) {
-      applied_torque_nm_[i] += alpha * (desired[i] - applied_torque_nm_[i]);
       applied_torque_nm_[i] =
-          clamp(applied_torque_nm_[i], -g_config.torque_limit_nm, g_config.torque_limit_nm);
+          clamp(desired[i], -g_config.torque_limit_nm, g_config.torque_limit_nm);
       data->ctrl[actuator_ids_[i]] = applied_torque_nm_[i];
+    }
+  }
+
+  void enforceFixedPendulum(mjModel* model, mjData* data, bool recompute) {
+    if (!g_config.fixed_pendulum) {
+      return;
+    }
+    if (!initialized_) {
+      initialize(model);
+    }
+
+    const int qpos = model->jnt_qposadr[pendulum_ball_joint_id_];
+    const int qvel = model->jnt_dofadr[pendulum_ball_joint_id_];
+    const auto zero_pendulum_state = [&]() {
+      data->qpos[qpos + 0] = 1.0;
+      data->qpos[qpos + 1] = 0.0;
+      data->qpos[qpos + 2] = 0.0;
+      data->qpos[qpos + 3] = 0.0;
+
+      data->qvel[qvel + 0] = 0.0;
+      data->qvel[qvel + 1] = 0.0;
+      data->qvel[qvel + 2] = 0.0;
+      data->qacc[qvel + 0] = 0.0;
+      data->qacc[qvel + 1] = 0.0;
+      data->qacc[qvel + 2] = 0.0;
+      data->qacc_warmstart[qvel + 0] = 0.0;
+      data->qacc_warmstart[qvel + 1] = 0.0;
+      data->qacc_warmstart[qvel + 2] = 0.0;
+    };
+
+    zero_pendulum_state();
+    if (recompute) {
+      mj_forward(model, data);
+      zero_pendulum_state();
     }
   }
 
@@ -533,6 +562,10 @@ class OmniwheelRosBridge : public rclcpp::Node {
   }
 
   std::array<double, 2> pendulumAngles() const {
+    if (g_config.fixed_pendulum) {
+      return {0.0, 0.0};
+    }
+
     const int qpos = g_model->jnt_qposadr[pendulum_ball_joint_id_];
     mjtNum quat[4] = {g_data->qpos[qpos + 0], g_data->qpos[qpos + 1], g_data->qpos[qpos + 2],
                       g_data->qpos[qpos + 3]};
@@ -547,6 +580,10 @@ class OmniwheelRosBridge : public rclcpp::Node {
   }
 
   std::array<double, 2> pendulumVelocities() const {
+    if (g_config.fixed_pendulum) {
+      return {0.0, 0.0};
+    }
+
     const int qvel = g_model->jnt_dofadr[pendulum_ball_joint_id_];
     return {-g_data->qvel[qvel + 2], -g_data->qvel[qvel + 0]};
   }
@@ -659,10 +696,12 @@ std::shared_ptr<OmniwheelRosBridge> g_bridge;
 
 void stepPhysics(mjModel* model, mjData* data) {
   if (g_bridge) {
+    g_bridge->enforceFixedPendulum(model, data, false);
     g_bridge->applyControls(model, data);
   }
   mj_step(model, data);
   if (g_bridge) {
+    g_bridge->enforceFixedPendulum(model, data, true);
     g_bridge->publishClock(data->time);
   }
 }
@@ -688,6 +727,9 @@ void PhysicsLoop(mj::Simulate& sim) {
         g_model = mnew;
         g_data = dnew;
         mj_forward(g_model, g_data);
+        if (g_bridge) {
+          g_bridge->enforceFixedPendulum(g_model, g_data, true);
+        }
         free(g_ctrl_noise);
         g_ctrl_noise = static_cast<mjtNum*>(malloc(sizeof(mjtNum) * g_model->nu));
         mju_zero(g_ctrl_noise, g_model->nu);
@@ -711,6 +753,9 @@ void PhysicsLoop(mj::Simulate& sim) {
         g_model = mnew;
         g_data = dnew;
         mj_forward(g_model, g_data);
+        if (g_bridge) {
+          g_bridge->enforceFixedPendulum(g_model, g_data, true);
+        }
         free(g_ctrl_noise);
         g_ctrl_noise = static_cast<mjtNum*>(malloc(sizeof(mjtNum) * g_model->nu));
         mju_zero(g_ctrl_noise, g_model->nu);
@@ -774,9 +819,15 @@ void PhysicsLoop(mj::Simulate& sim) {
           sim.AddToHistory();
         }
       } else {
+        if (g_bridge) {
+          g_bridge->enforceFixedPendulum(g_model, g_data, false);
+        }
         mj_forward(g_model, g_data);
         if (sim.pause_update) {
           mju_copy(g_data->qacc_warmstart, g_data->qacc, g_model->nv);
+        }
+        if (g_bridge) {
+          g_bridge->enforceFixedPendulum(g_model, g_data, false);
         }
         sim.speed_changed = true;
       }
@@ -794,6 +845,9 @@ void PhysicsThread(mj::Simulate* sim, const char* filename) {
     if (g_data) {
       sim->Load(g_model, g_data, filename);
       mj_forward(g_model, g_data);
+      if (g_bridge) {
+        g_bridge->enforceFixedPendulum(g_model, g_data, true);
+      }
       free(g_ctrl_noise);
       g_ctrl_noise = static_cast<mjtNum*>(malloc(sizeof(mjtNum) * g_model->nu));
       mju_zero(g_ctrl_noise, g_model->nu);
@@ -815,6 +869,9 @@ void PhysicsThread(mj::Simulate* sim, const char* filename) {
 void userKeyCallback(GLFWwindow* /*window*/, int key, int /*scancode*/, int act, int /*mods*/) {
   if (act == GLFW_PRESS && key == GLFW_KEY_BACKSPACE && g_model && g_data) {
     mj_resetData(g_model, g_data);
+    if (g_bridge) {
+      g_bridge->enforceFixedPendulum(g_model, g_data, false);
+    }
     mj_forward(g_model, g_data);
   }
 }
