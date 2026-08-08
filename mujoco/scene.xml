@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <mujoco model="omni_pendulum_scene">
   <include file="omni_pendulum.xml" />
-  <option timestep="0.002" gravity="0 0 -9.81" integrator="RK4" />
+  <option timestep="0.002" gravity="0 0 -9.81" integrator="implicitfast" />
   <statistic center="0 0 0.35" extent="2.0" />
   <visual>
     <headlight ambient="0.25 0.25 0.25" diffuse="0.55 0.55 0.55" specular="0.15 0.15 0.15" />

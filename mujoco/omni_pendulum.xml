@@ -697,9 +697,9 @@
     </body>
   </worldbody>
   <actuator>
-    <motor name="rim_left_motor" joint="rim_left_joint" ctrlrange="-7.1 7.1" ctrllimited="true" forcerange="-7.1 7.1" forcelimited="true" />
-    <motor name="rim_right_motor" joint="rim_right_joint" ctrlrange="-7.1 7.1" ctrllimited="true" forcerange="-7.1 7.1" forcelimited="true" />
-    <motor name="rim_back_motor" joint="rim_back_joint" ctrlrange="-7.1 7.1" ctrllimited="true" forcerange="-7.1 7.1" forcelimited="true" />
+    <velocity name="rim_left_motor" joint="rim_left_joint" kv="1" ctrlrange="-7.194247 7.194247" ctrllimited="true" forcerange="-7.1 7.1" forcelimited="true" />
+    <velocity name="rim_right_motor" joint="rim_right_joint" kv="1" ctrlrange="-7.194247 7.194247" ctrllimited="true" forcerange="-7.1 7.1" forcelimited="true" />
+    <velocity name="rim_back_motor" joint="rim_back_joint" kv="1" ctrlrange="-7.194247 7.194247" ctrllimited="true" forcerange="-7.1 7.1" forcelimited="true" />
   </actuator>
   <sensor>
     <jointpos name="rim_left_joint_pos" joint="rim_left_joint" />

@@ -14,6 +14,7 @@ find_package(nav_msgs REQUIRED)
 find_package(rosgraph_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(yaml-cpp REQUIRED)
+find_package(onnxruntime_vendor REQUIRED)
 
 set(MUJOCO_ROOT /workspace/omniwheel_mujoco/dependencies/mujoco)
 
@@ -60,11 +61,30 @@ ament_target_dependencies(omniwheel_mujoco_sim
   tf2_ros
 )
 
-install(TARGETS omniwheel_mujoco_sim
+add_executable(omniwheel_policy_node
+  src/policy_node.cpp
+)
+
+target_compile_features(omniwheel_policy_node PUBLIC cxx_std_17)
+
+target_link_libraries(omniwheel_policy_node
+  onnxruntime::onnxruntime
+)
+
+ament_target_dependencies(omniwheel_policy_node
+  rclcpp
+  sensor_msgs
+  geometry_msgs
+  nav_msgs
+)
+
+install(TARGETS
+  omniwheel_mujoco_sim
+  omniwheel_policy_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
-install(DIRECTORY launch urdf
+install(DIRECTORY launch urdf models
   DESTINATION share/${PROJECT_NAME}
 )
 

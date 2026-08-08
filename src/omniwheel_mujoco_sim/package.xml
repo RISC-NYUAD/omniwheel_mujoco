@@ -17,6 +17,7 @@
   <depend>rosgraph_msgs</depend>
   <depend>tf2_ros</depend>
   <depend>robot_state_publisher</depend>
+  <depend>onnxruntime_vendor</depend>
 
   <build_depend>yaml-cpp</build_depend>
   <exec_depend>yaml-cpp</exec_depend>

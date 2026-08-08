@@ -32,8 +32,8 @@
 
 #include <builtin_interfaces/msg/time.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <geometry_msgs/msg/twist.hpp>
 #include <geometry_msgs/msg/twist_with_covariance_stamped.hpp>
-#include <geometry_msgs/msg/wrench.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rosgraph_msgs/msg/clock.hpp>
@@ -61,6 +61,9 @@ constexpr double kPi = 3.14159265358979323846;
 constexpr int kErrorLength = 1024;
 constexpr double kSyncMisalign = 0.1;
 constexpr double kSimRefreshFraction = 0.7;
+constexpr double kWheelRadiusM = 0.101;
+constexpr double kBaseRadiusM = 0.1285;
+constexpr double kWheelVelocityLimitRadS = 7.194247;
 using Seconds = std::chrono::duration<double>;
 
 mjModel* g_model = nullptr;
@@ -70,8 +73,10 @@ mjtNum* g_ctrl_noise = nullptr;
 struct SimulationConfig {
   std::filesystem::path scene_file{"/workspace/omniwheel_mujoco/mujoco/scene.xml"};
   double publish_rate_hz{100.0};
-  double command_timeout_sec{0.2};
-  double torque_limit_nm{4.7};
+  double command_timeout_sec{0.5};
+  double max_linear_acceleration_m_s2{2.0};
+  double max_yaw_acceleration_rad_s2{2.2};
+  double wheel_velocity_limit_rad_s{kWheelVelocityLimitRadS};
   int encoder_ticks_per_rev{4096};
   bool fixed_pendulum{false};
   bool print_scene_information{true};
@@ -208,8 +213,16 @@ void loadConfig(const std::filesystem::path& config_file) {
   if (cfg["command_timeout_sec"]) {
     g_config.command_timeout_sec = cfg["command_timeout_sec"].as<double>();
   }
-  if (cfg["torque_limit_nm"]) {
-    g_config.torque_limit_nm = cfg["torque_limit_nm"].as<double>();
+  if (cfg["max_linear_acceleration_m_s2"]) {
+    g_config.max_linear_acceleration_m_s2 =
+        cfg["max_linear_acceleration_m_s2"].as<double>();
+  }
+  if (cfg["max_yaw_acceleration_rad_s2"]) {
+    g_config.max_yaw_acceleration_rad_s2 =
+        cfg["max_yaw_acceleration_rad_s2"].as<double>();
+  }
+  if (cfg["wheel_velocity_limit_rad_s"]) {
+    g_config.wheel_velocity_limit_rad_s = cfg["wheel_velocity_limit_rad_s"].as<double>();
   }
   if (cfg["encoder_ticks_per_rev"]) {
     g_config.encoder_ticks_per_rev = cfg["encoder_ticks_per_rev"].as<int>();
@@ -237,20 +250,19 @@ double clamp(double value, double low, double high) {
   return std::min(std::max(value, low), high);
 }
 
-std::array<double, 3> baseWrenchToMotorTorquesLeftRightBack(double force_x, double force_y,
-                                                            double torque_z) {
-  // Closed form of omni_motor_bulkctrl_torque.cpp's J_torque matrix.
+std::array<double, 3> baseTwistToWheelVelocitiesLeftRightBack(double velocity_x,
+                                                              double velocity_y,
+                                                              double angular_velocity_z) {
+  // Closed form of omni_motor_bulkctrl_velocity.cpp's J_vel matrix.
   // Output order is XML actuator order: rim_left_motor, rim_right_motor, rim_back_motor.
-  constexpr double wheel_radius_m = 0.101;
-  constexpr double base_radius_m = 0.1285;
-  const double torque_z_coeff = wheel_radius_m / (3.0 * base_radius_m);
-
   return {
-      (-wheel_radius_m / std::sqrt(3.0)) * force_x + (wheel_radius_m / 3.0) * force_y +
-          torque_z_coeff * torque_z,
-      (wheel_radius_m / std::sqrt(3.0)) * force_x + (wheel_radius_m / 3.0) * force_y +
-          torque_z_coeff * torque_z,
-      -(2.0 * wheel_radius_m / 3.0) * force_y + torque_z_coeff * torque_z,
+      (-std::sqrt(3.0) * velocity_x / 2.0 + velocity_y / 2.0 +
+       kBaseRadiusM * angular_velocity_z) /
+          kWheelRadiusM,
+      (std::sqrt(3.0) * velocity_x / 2.0 + velocity_y / 2.0 +
+       kBaseRadiusM * angular_velocity_z) /
+          kWheelRadiusM,
+      (-velocity_y + kBaseRadiusM * angular_velocity_z) / kWheelRadiusM,
   };
 }
 
@@ -335,17 +347,17 @@ class OmniwheelRosBridge : public rclcpp::Node {
       : Node("omniwheel_mujoco_bridge"), sim_(sim) {
     using namespace std::chrono_literals;
 
-    wrench_sub_ = create_subscription<geometry_msgs::msg::Wrench>(
-        "/omni/cmd_wrench", rclcpp::QoS(10),
-        [this](const geometry_msgs::msg::Wrench::SharedPtr msg) {
-          const auto motor_torque_lrb =
-              baseWrenchToMotorTorquesLeftRightBack(msg->force.x, msg->force.y, msg->torque.z);
-
-          std::lock_guard<std::mutex> lock(command_mutex_);
-          for (std::size_t i = 0; i < 3; ++i) {
-            target_torque_nm_[i] =
-                clamp(motor_torque_lrb[i], -g_config.torque_limit_nm, g_config.torque_limit_nm);
+    velocity_sub_ = create_subscription<geometry_msgs::msg::Twist>(
+        "/nav_vel", rclcpp::QoS(1),
+        [this](const geometry_msgs::msg::Twist::SharedPtr msg) {
+          if (!std::isfinite(msg->linear.x) || !std::isfinite(msg->linear.y) ||
+              !std::isfinite(msg->angular.z)) {
+            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
+                                 "Ignoring /nav_vel command with non-finite values");
+            return;
           }
+          std::lock_guard<std::mutex> lock(command_mutex_);
+          target_base_twist_ = {msg->linear.x, msg->linear.y, msg->angular.z};
           last_command_time_ = std::chrono::steady_clock::now();
           command_received_ = true;
         });
@@ -372,21 +384,35 @@ class OmniwheelRosBridge : public rclcpp::Node {
       initialize(model);
     }
 
-    std::array<double, 3> desired{};
+    std::array<double, 3> desired_base_twist{};
     {
       std::lock_guard<std::mutex> lock(command_mutex_);
-      desired = target_torque_nm_;
+      desired_base_twist = target_base_twist_;
       if (!command_received_ ||
           std::chrono::duration<double>(std::chrono::steady_clock::now() - last_command_time_)
                   .count() > g_config.command_timeout_sec) {
-        desired = {0.0, 0.0, 0.0};
+        desired_base_twist = {0.0, 0.0, 0.0};
       }
     }
 
+    const double dt = std::max(0.0, static_cast<double>(model->opt.timestep));
+    const std::array<double, 3> max_velocity_steps = {
+        std::max(0.0, g_config.max_linear_acceleration_m_s2) * dt,
+        std::max(0.0, g_config.max_linear_acceleration_m_s2) * dt,
+        std::max(0.0, g_config.max_yaw_acceleration_rad_s2) * dt,
+    };
     for (std::size_t i = 0; i < 3; ++i) {
-      applied_torque_nm_[i] =
-          clamp(desired[i], -g_config.torque_limit_nm, g_config.torque_limit_nm);
-      data->ctrl[actuator_ids_[i]] = applied_torque_nm_[i];
+      const double delta = desired_base_twist[i] - applied_base_twist_[i];
+      applied_base_twist_[i] +=
+          clamp(delta, -max_velocity_steps[i], max_velocity_steps[i]);
+    }
+
+    const auto wheel_velocity_lrb = baseTwistToWheelVelocitiesLeftRightBack(
+        applied_base_twist_[0], applied_base_twist_[1], applied_base_twist_[2]);
+    const double wheel_velocity_limit = std::max(0.0, g_config.wheel_velocity_limit_rad_s);
+    for (std::size_t i = 0; i < 3; ++i) {
+      data->ctrl[actuator_ids_[i]] =
+          clamp(wheel_velocity_lrb[i], -wheel_velocity_limit, wheel_velocity_limit);
     }
   }
 
@@ -591,24 +617,15 @@ class OmniwheelRosBridge : public rclcpp::Node {
   void publishWheelOdometry(const builtin_interfaces::msg::Time& stamp) {
     const auto w_lrb = wheelVelocitiesLeftRightBack();
 
-    // Real joint-state order is Wheel_1, Wheel_2, Wheel_3. The sim command order is
-    // left, right, back, so Wheel_1 maps to right and Wheel_2 maps to left.
-    const double w1_right = w_lrb[1];
-    const double w2_left = w_lrb[0];
-    const double w3_back = w_lrb[2];
-
-    constexpr double alpha = 0.101;
-    constexpr double L = 0.1285;
-
     geometry_msgs::msg::TwistWithCovarianceStamped wheel_odom;
     wheel_odom.header.stamp = stamp;
     wheel_odom.header.frame_id = "base_link";
     wheel_odom.twist.twist.linear.x =
-        alpha * (-(std::sqrt(3.0) / 3.0) * w1_right + (std::sqrt(3.0) / 3.0) * w2_left);
+        (kWheelRadiusM / std::sqrt(3.0)) * (w_lrb[1] - w_lrb[0]);
     wheel_odom.twist.twist.linear.y =
-        alpha * ((2.0 / 3.0) * w3_back - (1.0 / 3.0) * w1_right - (1.0 / 3.0) * w2_left);
+        (kWheelRadiusM / 3.0) * (w_lrb[0] + w_lrb[1] - 2.0 * w_lrb[2]);
     wheel_odom.twist.twist.angular.z =
-        -alpha * ((w1_right + w2_left + w3_back) / (3.0 * L));
+        kWheelRadiusM * (w_lrb[0] + w_lrb[1] + w_lrb[2]) / (3.0 * kBaseRadiusM);
     setDiagonalCovariance(wheel_odom.twist.covariance, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1);
     wheel_odom_pub_->publish(wheel_odom);
   }
@@ -616,6 +633,10 @@ class OmniwheelRosBridge : public rclcpp::Node {
   void publishJointStates(const builtin_interfaces::msg::Time& stamp) {
     const auto wheel_pos_lrb = wheelPositionsLeftRightBack();
     const auto wheel_vel_lrb = wheelVelocitiesLeftRightBack();
+    std::array<double, 3> wheel_effort_lrb{};
+    for (std::size_t i = 0; i < 3; ++i) {
+      wheel_effort_lrb[i] = g_data->actuator_force[actuator_ids_[i]];
+    }
     const auto pendulum_pos = pendulumAngles();
     const auto pendulum_vel = pendulumVelocities();
 
@@ -633,9 +654,9 @@ class OmniwheelRosBridge : public rclcpp::Node {
     joint_state.velocity[0] = wheel_vel_lrb[1];
     joint_state.velocity[1] = wheel_vel_lrb[0];
     joint_state.velocity[2] = wheel_vel_lrb[2];
-    joint_state.effort[0] = applied_torque_nm_[1];
-    joint_state.effort[1] = applied_torque_nm_[0];
-    joint_state.effort[2] = applied_torque_nm_[2];
+    joint_state.effort[0] = wheel_effort_lrb[1];
+    joint_state.effort[1] = wheel_effort_lrb[0];
+    joint_state.effort[2] = wheel_effort_lrb[2];
 
     joint_state.position[3] = pendulum_pos[0];
     joint_state.position[4] = pendulum_pos[1];
@@ -677,12 +698,12 @@ class OmniwheelRosBridge : public rclcpp::Node {
   int base_freejoint_id_{-1};
 
   std::mutex command_mutex_;
-  std::array<double, 3> target_torque_nm_{0.0, 0.0, 0.0};
-  std::array<double, 3> applied_torque_nm_{0.0, 0.0, 0.0};
+  std::array<double, 3> target_base_twist_{0.0, 0.0, 0.0};
+  std::array<double, 3> applied_base_twist_{0.0, 0.0, 0.0};
   std::chrono::steady_clock::time_point last_command_time_{std::chrono::steady_clock::now()};
   bool command_received_{false};
 
-  rclcpp::Subscription<geometry_msgs::msg::Wrench>::SharedPtr wrench_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr velocity_sub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
   rclcpp::Publisher<geometry_msgs::msg::TwistWithCovarianceStamped>::SharedPtr wheel_odom_pub_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_state_pub_;

@@ -1,10 +1,14 @@
 scene_file: "/workspace/omniwheel_mujoco/mujoco/scene.xml"
 
 publish_rate_hz: 100.0
-command_timeout_sec: 0.2
+command_timeout_sec: 0.5
 
-# Per-wheel torque saturation after /omni/cmd_wrench is converted to motor torques.
-torque_limit_nm: 4.7
+# Base-frame command slew limits applied before conversion to wheel velocities.
+max_linear_acceleration_m_s2: 2.0
+max_yaw_acceleration_rad_s2: 2.2
+
+# Per-wheel speed limit matching the hardware controller's 68.7 RPM cap.
+wheel_velocity_limit_rad_s: 7.194247
 
 # Encoder-like quantization for wheel joint positions.
 encoder_ticks_per_rev: 4096
