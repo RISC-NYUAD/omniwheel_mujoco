@@ -29,7 +29,14 @@ ros2 topic pub -r 100 /omni/cmd_wrench geometry_msgs/msg/Wrench \
 
 The simulator uses `force.x`, `force.y`, and `torque.z`, converts them to wheel torques
 with the same Jacobian constants as `omni_motor_bulkctrl_torque.cpp`, saturates each
-wheel to `+/-4.7 Nm`, and decays to zero after a `0.2s` timeout.
+wheel to `+/-7.1 Nm` (`torque_limit_nm`), and drops the command to zero if none arrives
+within `0.2s`. While a wheel is motoring, its torque also follows the XH540-W150-R
+torque-speed envelope `|tau| <= 7.1 * V/12 - 7.1 * |w| / 7.33` (`simulate/config.yaml`),
+the same model `omniwheel_mjlab` trains with.
+
+Contacts use an elliptic friction cone with `impratio="50"` (`mujoco/scene*.xml`), matching
+`omniwheel_mjlab`. With MuJoCo's defaults (pyramidal, 1) the robot turns about 3.4x faster
+under the same yaw torque than in training.
 
 ## Published Interfaces
 
