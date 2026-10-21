@@ -16,7 +16,7 @@
       <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.235 0.302 0.141 0.361" mesh="base_link_mujoco" />
       <geom type="mesh" rgba="0.235 0.302 0.141 0.361" mesh="base_link_mujoco" contype="1" conaffinity="0" />
       <body name="rim_left_link" pos="0.06425 0.111284 0.101" quat="0.683013 0.683013 -0.183013 -0.183013">
-        <inertial pos="0 0 0" quat="0 0.707107 0 0.707107" mass="0.627" diaginertia="0.0030881 0.0015481 0.001548" />
+        <inertial pos="0 0 -0.0815" mass="6.627" diaginertia="0.006146 0.006146 0.0030881" />
         <joint name="rim_left_joint" pos="0 0 0" axis="0 0 1" actuatorfrcrange="-7.1 7.1" frictionloss="0.01" />
         <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0 0 1 1" mesh="rim" />
         <geom type="mesh" rgba="0 0 1 1" mesh="rim" contype="1" conaffinity="0" />
@@ -238,7 +238,7 @@
         </body>
       </body>
       <body name="rim_right_link" pos="0.06425 -0.111284 0.101" quat="-0.183013 -0.183013 0.683013 0.683013">
-        <inertial pos="0 0 0" quat="0 0.707107 0 0.707107" mass="0.627" diaginertia="0.0030881 0.0015481 0.001548" />
+        <inertial pos="0 0 -0.0815" mass="6.627" diaginertia="0.006146 0.006146 0.0030881" />
         <joint name="rim_right_joint" pos="0 0 0" axis="0 0 1" actuatorfrcrange="-7.1 7.1" frictionloss="0.01" />
         <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0 1 0 1" mesh="rim" />
         <geom type="mesh" rgba="0 1 0 1" mesh="rim" contype="1" conaffinity="0" />
@@ -460,7 +460,7 @@
         </body>
       </body>
       <body name="rim_back_link" pos="-0.1285 0 0.101" quat="0.5 0.5 0.5 0.5">
-        <inertial pos="0 0 0" quat="0 0.707107 0 0.707107" mass="0.627" diaginertia="0.0030881 0.0015481 0.001548" />
+        <inertial pos="0 0 -0.0815" mass="6.627" diaginertia="0.006146 0.006146 0.0030881" />
         <joint name="rim_back_joint" pos="0 0 0" axis="0 0 1" actuatorfrcrange="-7.1 7.1" frictionloss="0.01" />
         <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 0 0 1" mesh="rim" />
         <geom type="mesh" rgba="1 0 0 1" mesh="rim" contype="1" conaffinity="0" />

@@ -4,7 +4,18 @@ publish_rate_hz: 100.0
 command_timeout_sec: 0.2
 
 # Per-wheel torque saturation after /omni/cmd_wrench is converted to motor torques.
-torque_limit_nm: 4.7
+torque_limit_nm: 7.1
+
+# DC-motor torque-speed envelope, matching omniwheel_mjlab training (ROBOTIS
+# XH540-W150-R datasheet at 12 V). While a wheel is motoring:
+#   |tau| <= stall * V / V_n - stall * |w| / w_n
+# Braking torque is limited only by torque_limit_nm. Set supply_voltage_v to the
+# battery voltage to test (training samples 11.1-12.6 V).
+torque_speed_limit: true
+supply_voltage_v: 12.0
+motor_nominal_voltage_v: 12.0
+motor_stall_torque_nm: 7.1
+motor_no_load_speed_rad_s: 7.330  # 70 rpm
 
 # Encoder-like quantization for wheel joint positions.
 encoder_ticks_per_rev: 4096
