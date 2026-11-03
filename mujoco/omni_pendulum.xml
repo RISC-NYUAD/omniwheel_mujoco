@@ -2,6 +2,9 @@
 <mujoco model="omni_pendulum">
   <compiler angle="radian" meshdir="meshes" autolimits="true" />
   <asset>
+    <material name="weight_brown" rgba="0.70 0.58 0.32 1" specular="0.8" shininess="0.8" reflectance="0.05" />
+    <material name="weight_red" rgba="0.78 0.08 0.07 1" specular="0.8" shininess="0.8" reflectance="0.05" />
+    <material name="weight_holder" rgba="0.93 0.92 0.88 1" specular="0.2" shininess="0.3" />
     <mesh name="base_link_mujoco" file="base_link_mujoco.STL" content_type="model/stl" />
     <mesh name="rim" file="rim.STL" content_type="model/stl" />
     <mesh name="roller" file="roller.STL" content_type="model/stl" />
@@ -16,10 +19,15 @@
       <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.235 0.302 0.141 0.361" mesh="base_link_mujoco" />
       <geom type="mesh" rgba="0.235 0.302 0.141 0.361" mesh="base_link_mujoco" contype="1" conaffinity="0" />
       <body name="rim_left_link" pos="0.06425 0.111284 0.101" quat="0.683013 0.683013 -0.183013 -0.183013">
-        <inertial pos="0 0 0" quat="0 0.707107 0 0.707107" mass="0.627" diaginertia="0.0030881 0.0015481 0.001548" />
+        <inertial pos="0 0 -0.0815" mass="6.627" diaginertia="0.006146 0.006146 0.0030881" />
         <joint name="rim_left_joint" pos="0 0 0" axis="0 0 1" actuatorfrcrange="-7.1 7.1" frictionloss="0.01" />
         <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0 0 1 1" mesh="rim" />
         <geom type="mesh" rgba="0 0 1 1" mesh="rim" contype="1" conaffinity="0" />
+        <!-- Visual only: the spherical weight in its 3D-printed holder, at the rim's COM. -->
+        <geom name="rim_left_weight_holder" type="cylinder" size="0.042 0.026" pos="0 0 -0.036" contype="0" conaffinity="0" group="1" density="0" material="weight_holder" />
+        <geom name="rim_left_weight" type="sphere" size="0.06" pos="0 0 -0.0815" contype="0" conaffinity="0" group="1" density="0" material="weight_brown" />
+        <geom name="rim_left_weight_strap_x" type="cylinder" size="0.0614 0.004" pos="0 0 -0.0815" quat="0.707107 0 0.707107 0" contype="0" conaffinity="0" group="1" density="0" material="weight_holder" />
+        <geom name="rim_left_weight_strap_y" type="cylinder" size="0.0614 0.004" pos="0 0 -0.0815" quat="0.707107 0.707107 0 0" contype="0" conaffinity="0" group="1" density="0" material="weight_holder" />
         <body name="roller_0_rim_left_link" pos="0 0.09175 0.010375" quat="0.707107 0 0.707107 0">
           <inertial pos="0 0 0" mass="0.011095" diaginertia="4.7677e-07 4.7677e-07 2.9971e-07" />
           <joint name="roller_0_rim_left_joint" pos="0 0 0" axis="0 0 1" />
@@ -238,10 +246,15 @@
         </body>
       </body>
       <body name="rim_right_link" pos="0.06425 -0.111284 0.101" quat="-0.183013 -0.183013 0.683013 0.683013">
-        <inertial pos="0 0 0" quat="0 0.707107 0 0.707107" mass="0.627" diaginertia="0.0030881 0.0015481 0.001548" />
+        <inertial pos="0 0 -0.0815" mass="6.627" diaginertia="0.006146 0.006146 0.0030881" />
         <joint name="rim_right_joint" pos="0 0 0" axis="0 0 1" actuatorfrcrange="-7.1 7.1" frictionloss="0.01" />
         <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0 1 0 1" mesh="rim" />
         <geom type="mesh" rgba="0 1 0 1" mesh="rim" contype="1" conaffinity="0" />
+        <!-- Visual only: the spherical weight in its 3D-printed holder, at the rim's COM. -->
+        <geom name="rim_right_weight_holder" type="cylinder" size="0.042 0.026" pos="0 0 -0.036" contype="0" conaffinity="0" group="1" density="0" material="weight_holder" />
+        <geom name="rim_right_weight" type="sphere" size="0.06" pos="0 0 -0.0815" contype="0" conaffinity="0" group="1" density="0" material="weight_brown" />
+        <geom name="rim_right_weight_strap_x" type="cylinder" size="0.0614 0.004" pos="0 0 -0.0815" quat="0.707107 0 0.707107 0" contype="0" conaffinity="0" group="1" density="0" material="weight_holder" />
+        <geom name="rim_right_weight_strap_y" type="cylinder" size="0.0614 0.004" pos="0 0 -0.0815" quat="0.707107 0.707107 0 0" contype="0" conaffinity="0" group="1" density="0" material="weight_holder" />
         <body name="roller_0_rim_right_link" pos="0 0.09175 0.010375" quat="0.707107 0 0.707107 0">
           <inertial pos="0 0 0" mass="0.011095" diaginertia="4.7677e-07 4.7677e-07 2.9971e-07" />
           <joint name="roller_0_rim_right_joint" pos="0 0 0" axis="0 0 1" />
@@ -460,10 +473,15 @@
         </body>
       </body>
       <body name="rim_back_link" pos="-0.1285 0 0.101" quat="0.5 0.5 0.5 0.5">
-        <inertial pos="0 0 0" quat="0 0.707107 0 0.707107" mass="0.627" diaginertia="0.0030881 0.0015481 0.001548" />
+        <inertial pos="0 0 -0.0815" mass="6.627" diaginertia="0.006146 0.006146 0.0030881" />
         <joint name="rim_back_joint" pos="0 0 0" axis="0 0 1" actuatorfrcrange="-7.1 7.1" frictionloss="0.01" />
         <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="1 0 0 1" mesh="rim" />
         <geom type="mesh" rgba="1 0 0 1" mesh="rim" contype="1" conaffinity="0" />
+        <!-- Visual only: the spherical weight in its 3D-printed holder, at the rim's COM. -->
+        <geom name="rim_back_weight_holder" type="cylinder" size="0.042 0.026" pos="0 0 -0.036" contype="0" conaffinity="0" group="1" density="0" material="weight_holder" />
+        <geom name="rim_back_weight" type="sphere" size="0.06" pos="0 0 -0.0815" contype="0" conaffinity="0" group="1" density="0" material="weight_red" />
+        <geom name="rim_back_weight_strap_x" type="cylinder" size="0.0614 0.004" pos="0 0 -0.0815" quat="0.707107 0 0.707107 0" contype="0" conaffinity="0" group="1" density="0" material="weight_holder" />
+        <geom name="rim_back_weight_strap_y" type="cylinder" size="0.0614 0.004" pos="0 0 -0.0815" quat="0.707107 0.707107 0 0" contype="0" conaffinity="0" group="1" density="0" material="weight_holder" />
         <body name="roller_0_rim_back_link" pos="0 0.09175 0.010375" quat="0.707107 0 0.707107 0">
           <inertial pos="0 0 0" mass="0.011095" diaginertia="4.7677e-07 4.7677e-07 2.9971e-07" />
           <joint name="roller_0_rim_back_joint" pos="0 0 0" axis="0 0 1" />

@@ -71,7 +71,15 @@ struct SimulationConfig {
   std::filesystem::path scene_file{"/workspace/omniwheel_mujoco/mujoco/scene.xml"};
   double publish_rate_hz{100.0};
   double command_timeout_sec{0.2};
-  double torque_limit_nm{4.7};
+  double torque_limit_nm{7.1};
+  // DC-motor torque-speed envelope (XH540-W150-R datasheet at 12 V), matching
+  // omniwheel_mjlab training. While motoring:
+  //   |tau| <= stall * V / V_n - stall * |w| / w_n.
+  bool torque_speed_limit{true};
+  double supply_voltage_v{12.0};
+  double motor_nominal_voltage_v{12.0};
+  double motor_stall_torque_nm{7.1};
+  double motor_no_load_speed_rad_s{70.0 * 2.0 * M_PI / 60.0};
   int encoder_ticks_per_rev{4096};
   bool fixed_pendulum{false};
   bool print_scene_information{true};
@@ -210,6 +218,21 @@ void loadConfig(const std::filesystem::path& config_file) {
   }
   if (cfg["torque_limit_nm"]) {
     g_config.torque_limit_nm = cfg["torque_limit_nm"].as<double>();
+  }
+  if (cfg["torque_speed_limit"]) {
+    g_config.torque_speed_limit = cfg["torque_speed_limit"].as<bool>();
+  }
+  if (cfg["supply_voltage_v"]) {
+    g_config.supply_voltage_v = cfg["supply_voltage_v"].as<double>();
+  }
+  if (cfg["motor_nominal_voltage_v"]) {
+    g_config.motor_nominal_voltage_v = cfg["motor_nominal_voltage_v"].as<double>();
+  }
+  if (cfg["motor_stall_torque_nm"]) {
+    g_config.motor_stall_torque_nm = cfg["motor_stall_torque_nm"].as<double>();
+  }
+  if (cfg["motor_no_load_speed_rad_s"]) {
+    g_config.motor_no_load_speed_rad_s = cfg["motor_no_load_speed_rad_s"].as<double>();
   }
   if (cfg["encoder_ticks_per_rev"]) {
     g_config.encoder_ticks_per_rev = cfg["encoder_ticks_per_rev"].as<int>();
@@ -384,10 +407,27 @@ class OmniwheelRosBridge : public rclcpp::Node {
     }
 
     for (std::size_t i = 0; i < 3; ++i) {
-      applied_torque_nm_[i] =
-          clamp(desired[i], -g_config.torque_limit_nm, g_config.torque_limit_nm);
+      double torque = desired[i];
+      if (g_config.torque_speed_limit) {
+        const double wheel_vel = data->qvel[model->jnt_dofadr[wheel_joint_ids_[i]]];
+        torque = limitByTorqueSpeedEnvelope(torque, wheel_vel);
+      }
+      applied_torque_nm_[i] = clamp(torque, -g_config.torque_limit_nm, g_config.torque_limit_nm);
       data->ctrl[actuator_ids_[i]] = applied_torque_nm_[i];
     }
+  }
+
+  // Back-EMF headroom of the motor's current loop: only motoring torque (same sign
+  // as wheel velocity) is limited; braking passes through to the plain clamp.
+  static double limitByTorqueSpeedEnvelope(double torque, double wheel_vel) {
+    if (torque * wheel_vel <= 0.0) {
+      return torque;
+    }
+    const double stall = g_config.motor_stall_torque_nm;
+    const double available =
+        std::max(0.0, stall * g_config.supply_voltage_v / g_config.motor_nominal_voltage_v -
+                          stall * std::abs(wheel_vel) / g_config.motor_no_load_speed_rad_s);
+    return clamp(torque, -available, available);
   }
 
   void enforceFixedPendulum(mjModel* model, mjData* data, bool recompute) {
