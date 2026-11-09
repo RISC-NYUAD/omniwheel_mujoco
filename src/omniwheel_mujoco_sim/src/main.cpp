@@ -733,6 +733,8 @@ class OmniwheelRosBridge : public rclcpp::Node {
 };
 
 std::shared_ptr<OmniwheelRosBridge> g_bridge;
+// Simulate's own key handler, which owns the default shortcuts (space pauses/resumes).
+GLFWkeyfun g_simulate_key_callback = nullptr;
 
 void stepPhysics(mjModel* model, mjData* data) {
   if (g_bridge) {
@@ -906,13 +908,19 @@ void PhysicsThread(mj::Simulate* sim, const char* filename) {
   g_model = nullptr;
 }
 
-void userKeyCallback(GLFWwindow* /*window*/, int key, int /*scancode*/, int act, int /*mods*/) {
-  if (act == GLFW_PRESS && key == GLFW_KEY_BACKSPACE && g_model && g_data) {
-    mj_resetData(g_model, g_data);
-    if (g_bridge) {
-      g_bridge->enforceFixedPendulum(g_model, g_data, false);
+void userKeyCallback(GLFWwindow* window, int key, int scancode, int act, int mods) {
+  if (key == GLFW_KEY_BACKSPACE) {
+    if (act == GLFW_PRESS && g_model && g_data) {
+      mj_resetData(g_model, g_data);
+      if (g_bridge) {
+        g_bridge->enforceFixedPendulum(g_model, g_data, false);
+      }
+      mj_forward(g_model, g_data);
     }
-    mj_forward(g_model, g_data);
+    return;
+  }
+  if (g_simulate_key_callback) {
+    g_simulate_key_callback(window, key, scancode, act, mods);
   }
 }
 
@@ -940,6 +948,7 @@ int main(int argc, char** argv) {
 
   auto sim = std::make_unique<mj::Simulate>(
       std::make_unique<mj::GlfwAdapter>(), &cam, &opt, &pert, false);
+  sim->run = 0;  // start paused; press space to run
 
   g_bridge = std::make_shared<OmniwheelRosBridge>(sim.get());
   rclcpp::executors::SingleThreadedExecutor executor;
@@ -948,7 +957,8 @@ int main(int argc, char** argv) {
 
   std::thread physics_thread(&PhysicsThread, sim.get(), g_config.scene_file.c_str());
 
-  glfwSetKeyCallback(static_cast<mj::GlfwAdapter*>(sim->platform_ui.get())->window_, userKeyCallback);
+  g_simulate_key_callback = glfwSetKeyCallback(
+      static_cast<mj::GlfwAdapter*>(sim->platform_ui.get())->window_, userKeyCallback);
   sim->RenderLoop();
   sim->exitrequest.store(true);
 
