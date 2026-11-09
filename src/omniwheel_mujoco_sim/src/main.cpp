@@ -18,14 +18,18 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
+#include <iterator>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <optional>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -86,6 +90,54 @@ struct SimulationConfig {
 };
 
 SimulationConfig g_config;
+
+constexpr double kDegToRad = kPi / 180.0;
+// Policy action units are wrench / scale (ActionScaling in omniwheel_ros policy.py).
+constexpr double kActionForceScaleN = 100.0;
+constexpr double kActionYawTorqueScaleNm = 13.5;
+constexpr int kRollersPerWheel = 36;
+
+// Domain-randomization knobs shown as viewer sliders, mirroring the omniwheel_mjlab training
+// randomizations (run ft_t7). Each default is the midpoint of its slider range: for per-episode
+// values that is the midpoint of the training range, for per-step noise it is the training
+// amplitude (the sliders go to twice that). Guarded by Simulate::mtx: the viewer writes it while
+// handling events, the physics thread reads it every step and the ROS thread on every publish.
+struct DomainParams {
+  // Robot physics.
+  mjtNum mass_scale = 1.0;                      // base mass and inertia
+  mjtNum com_offset_cm[3] = {0.0, 0.0, 1.0};    // base COM, body frame
+  mjtNum pendulum_max_angle_deg = 10.0;         // ball-joint cone limit
+  mjtNum pendulum_damping = 0.05;
+  mjtNum pendulum_friction = 0.01;
+  mjtNum rim_damping = 0.025;
+  mjtNum rim_friction = 0.01;
+  mjtNum roller_damping = 0.0005;
+  mjtNum roller_friction = 0.01;
+  mjtNum ground_friction = 1.2;                 // wheel-ground sliding friction
+
+  // Motors. Per-wheel arrays are left, right, back; action arrays are fx, fy, tz.
+  mjtNum torque_strength[3] = {1.0, 1.0, 1.0};
+  mjtNum torque_offset_nm[3] = {0.0, 0.0, 0.0};
+  mjtNum motor_lag_ms = 10.0;
+  mjtNum action_delay_ms = 1000.0 / 60.0;
+  mjtNum action_offset[3] = {0.0, 0.0, 0.0};    // policy action units
+  mjtNum action_jitter_std = 0.02;              // policy action units, Gaussian
+  mjtNum action_hold_pct = 1.0;
+
+  // Sensors. Pendulum arrays follow Pendulum_Joint_1, Pendulum_Joint_2.
+  mjtNum pendulum_angle_noise_deg = 0.35;       // uniform +-
+  mjtNum pendulum_rate_noise_deg_s = 3.0;       // uniform +-
+  mjtNum pendulum_angle_offset_deg[2] = {0.0, 0.0};
+  mjtNum pendulum_rate_offset_deg_s[2] = {0.0, 0.0};
+  mjtNum pendulum_delay_ms = 25.0;
+  mjtNum pendulum_hold_pct = 1.0;
+  mjtNum base_vel_noise = 0.03;                 // uniform +-, m/s and rad/s
+  mjtNum base_vel_offset[3] = {0.0, 0.0, 0.0};  // vx, vy (m/s), wz (rad/s)
+  mjtNum base_vel_delay_ms = 1000.0 / 60.0;
+  mjtNum base_vel_hold_pct = 0.5;
+};
+
+DomainParams g_params;
 
 std::string getExecutableDir() {
 #if defined(_WIN32) || defined(__CYGWIN__)
@@ -352,6 +404,136 @@ mjModel* LoadModel(const char* file, mj::Simulate& sim) {
   return mnew;
 }
 
+// Writes the "Robot physics" sliders into the model, the way training's reset events do: base
+// mass and inertia scaled and the COM offset relative to the MJCF (then mj_setConst, as mjlab
+// does), and absolute joint damping, friction loss and pendulum cone limit. Ground friction goes
+// to both the wheel contact geoms and the floor, because MuJoCo uses the larger of the two
+// geoms' values and the floor would otherwise mask low settings.
+class ModelRandomizer {
+ public:
+  ~ModelRandomizer() {
+    if (scratch_) {
+      mj_deleteData(scratch_);
+    }
+  }
+
+  void apply(mjModel* m, const DomainParams& p) {
+    if (m != model_) {
+      capture(m);
+    }
+
+    if (pendulum_joint_ >= 0) {
+      m->jnt_range[2 * pendulum_joint_ + 1] = p.pendulum_max_angle_deg * kDegToRad;
+      const int dof = m->jnt_dofadr[pendulum_joint_];
+      for (int i = 0; i < 3; ++i) {
+        m->dof_damping[dof + i] = p.pendulum_damping;
+        m->dof_frictionloss[dof + i] = p.pendulum_friction;
+      }
+    }
+    for (const int dof : rim_dofs_) {
+      m->dof_damping[dof] = p.rim_damping;
+      m->dof_frictionloss[dof] = p.rim_friction;
+    }
+    for (const int dof : roller_dofs_) {
+      m->dof_damping[dof] = p.roller_damping;
+      m->dof_frictionloss[dof] = p.roller_friction;
+    }
+    for (const int geom : contact_geoms_) {
+      m->geom_friction[3 * geom] = p.ground_friction;
+    }
+
+    const bool inertial_changed =
+        p.mass_scale != applied_mass_scale_ ||
+        !std::equal(std::begin(p.com_offset_cm), std::end(p.com_offset_cm),
+                    std::begin(applied_com_offset_cm_));
+    if (base_body_ >= 0 && (inertial_dirty_ || inertial_changed)) {
+      m->body_mass[base_body_] = nominal_mass_ * p.mass_scale;
+      for (int k = 0; k < 3; ++k) {
+        m->body_inertia[3 * base_body_ + k] = nominal_inertia_[k] * p.mass_scale;
+        m->body_ipos[3 * base_body_ + k] = nominal_ipos_[k] + p.com_offset_cm[k] / 100.0;
+      }
+      mj_setConst(m, scratch_);  // scratch data: mj_setConst overwrites the state it is given
+      applied_mass_scale_ = p.mass_scale;
+      std::copy(std::begin(p.com_offset_cm), std::end(p.com_offset_cm),
+                std::begin(applied_com_offset_cm_));
+      inertial_dirty_ = false;
+    }
+  }
+
+ private:
+  void capture(mjModel* m) {
+    model_ = m;
+    if (scratch_) {
+      mj_deleteData(scratch_);
+    }
+    scratch_ = mj_makeData(m);
+    inertial_dirty_ = true;
+
+    base_body_ = mj_name2id(m, mjOBJ_BODY, "base_link");
+    if (base_body_ >= 0) {
+      nominal_mass_ = m->body_mass[base_body_];
+      for (int k = 0; k < 3; ++k) {
+        nominal_inertia_[k] = m->body_inertia[3 * base_body_ + k];
+        nominal_ipos_[k] = m->body_ipos[3 * base_body_ + k];
+      }
+    }
+    pendulum_joint_ = mj_name2id(m, mjOBJ_JOINT, "pendulum_ball_joint");
+
+    rim_dofs_.clear();
+    roller_dofs_.clear();
+    contact_geoms_.clear();
+    std::vector<bool> wheel_body(m->nbody, false);
+    const auto add_dof = [m](const std::string& joint, std::vector<int>* dofs) {
+      const int id = mj_name2id(m, mjOBJ_JOINT, joint.c_str());
+      if (id >= 0) {
+        dofs->push_back(m->jnt_dofadr[id]);
+      }
+    };
+    const auto mark_body = [m, &wheel_body](const std::string& body) {
+      const int id = mj_name2id(m, mjOBJ_BODY, body.c_str());
+      if (id >= 0) {
+        wheel_body[id] = true;
+      }
+    };
+    for (const char* wheel : {"left", "right", "back"}) {
+      const std::string rim = std::string("rim_") + wheel;
+      add_dof(rim + "_joint", &rim_dofs_);
+      mark_body(rim + "_link");
+      for (int i = 0; i < kRollersPerWheel; ++i) {
+        const std::string roller = "roller_" + std::to_string(i) + "_" + rim;
+        add_dof(roller + "_joint", &roller_dofs_);
+        mark_body(roller + "_link");
+      }
+    }
+    for (int g = 0; g < m->ngeom; ++g) {
+      const bool collides = m->geom_contype[g] != 0 || m->geom_conaffinity[g] != 0;
+      if (collides && wheel_body[m->geom_bodyid[g]]) {
+        contact_geoms_.push_back(g);
+      }
+    }
+    const int ground = mj_name2id(m, mjOBJ_GEOM, "ground");
+    if (ground >= 0) {
+      contact_geoms_.push_back(ground);
+    }
+  }
+
+  const mjModel* model_ = nullptr;  // compared only; a reload allocates before freeing the old
+  mjData* scratch_ = nullptr;
+  int base_body_ = -1;
+  mjtNum nominal_mass_ = 0.0;
+  mjtNum nominal_inertia_[3] = {0.0, 0.0, 0.0};
+  mjtNum nominal_ipos_[3] = {0.0, 0.0, 0.0};
+  int pendulum_joint_ = -1;
+  std::vector<int> rim_dofs_;
+  std::vector<int> roller_dofs_;
+  std::vector<int> contact_geoms_;
+  bool inertial_dirty_ = true;
+  mjtNum applied_mass_scale_ = 0.0;
+  mjtNum applied_com_offset_cm_[3] = {0.0, 0.0, 0.0};
+};
+
+ModelRandomizer g_model_randomizer;
+
 class OmniwheelRosBridge : public rclcpp::Node {
  public:
   explicit OmniwheelRosBridge(mj::Simulate* sim)
@@ -361,14 +543,9 @@ class OmniwheelRosBridge : public rclcpp::Node {
     wrench_sub_ = create_subscription<geometry_msgs::msg::Wrench>(
         "/omni/cmd_wrench", rclcpp::QoS(10),
         [this](const geometry_msgs::msg::Wrench::SharedPtr msg) {
-          const auto motor_torque_lrb =
-              baseWrenchToMotorTorquesLeftRightBack(msg->force.x, msg->force.y, msg->torque.z);
-
           std::lock_guard<std::mutex> lock(command_mutex_);
-          for (std::size_t i = 0; i < 3; ++i) {
-            target_torque_nm_[i] =
-                clamp(motor_torque_lrb[i], -g_config.torque_limit_nm, g_config.torque_limit_nm);
-          }
+          command_wrench_ = {msg->force.x, msg->force.y, msg->torque.z};
+          ++command_seq_;
           last_command_time_ = std::chrono::steady_clock::now();
           command_received_ = true;
         });
@@ -390,30 +567,97 @@ class OmniwheelRosBridge : public rclcpp::Node {
         std::bind(&OmniwheelRosBridge::publishState, this));
   }
 
+  // Actuation in the order training applies it (BaseWrenchWheelTorqueAction): the received
+  // wrench in policy action units gets an offset and Gaussian jitter and is clipped, a new
+  // command is occasionally dropped (the previous one is held), and the result is delayed. Then
+  // wheel torques get the per-wheel strength and offset, first-order motor lag and the
+  // torque-speed envelope. Runs on the physics thread with Simulate::mtx held.
   void applyControls(mjModel* model, mjData* data) {
     if (!initialized_) {
       initialize(model);
     }
+    syncTime(data->time);
+    const DomainParams& p = g_params;
 
-    std::array<double, 3> desired{};
+    std::array<double, 3> wrench{};
+    std::uint64_t seq = 0;
+    bool timed_out = false;
     {
       std::lock_guard<std::mutex> lock(command_mutex_);
-      desired = target_torque_nm_;
-      if (!command_received_ ||
-          std::chrono::duration<double>(std::chrono::steady_clock::now() - last_command_time_)
-                  .count() > g_config.command_timeout_sec) {
-        desired = {0.0, 0.0, 0.0};
+      wrench = command_wrench_;
+      seq = command_seq_;
+      timed_out = !command_received_ ||
+                  std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                                last_command_time_)
+                          .count() > g_config.command_timeout_sec;
+    }
+    if (timed_out) {
+      // No controller: motors off, and no noise or offsets that would push the robot around.
+      resetActuation();
+      for (std::size_t i = 0; i < 3; ++i) {
+        applied_torque_nm_[i] = 0.0;
+        data->ctrl[actuator_ids_[i]] = 0.0;
       }
+      return;
     }
 
+    if (seq != last_command_seq_) {
+      last_command_seq_ = seq;
+      std::array<double, 3> packet = {wrench[0] / kActionForceScaleN,
+                                      wrench[1] / kActionForceScaleN,
+                                      wrench[2] / kActionYawTorqueScaleNm};
+      for (std::size_t i = 0; i < 3; ++i) {
+        packet[i] = clamp(packet[i], -1.0, 1.0) + p.action_offset[i] +
+                    p.action_jitter_std * gaussian_(physics_rng_);
+        packet[i] = clamp(packet[i], -1.0, 1.0);
+      }
+      if (unit_(physics_rng_) < p.action_hold_pct / 100.0) {
+        packet = held_packet_;
+      }
+      held_packet_ = packet;
+      packet_queue_.emplace_back(data->time, packet);
+    }
+
+    // Newest command that is at least the delay old; zero until the first one is.
+    const double cutoff = data->time - p.action_delay_ms / 1000.0;
+    while (packet_queue_.size() >= 2 && packet_queue_[1].first <= cutoff) {
+      packet_queue_.pop_front();
+    }
+    std::array<double, 3> action{};
+    if (!packet_queue_.empty() && packet_queue_.front().first <= cutoff) {
+      action = packet_queue_.front().second;
+    }
+
+    const double limit = g_config.torque_limit_nm;
+    const auto target = baseWrenchToMotorTorquesLeftRightBack(
+        action[0] * kActionForceScaleN, action[1] * kActionForceScaleN,
+        action[2] * kActionYawTorqueScaleNm);
+    const double tau = p.motor_lag_ms / 1000.0;
+    const double alpha = tau > 0.0 ? 1.0 - std::exp(-model->opt.timestep / tau) : 1.0;
     for (std::size_t i = 0; i < 3; ++i) {
-      double torque = desired[i];
+      double torque = clamp(target[i], -limit, limit);
+      torque = clamp(torque * p.torque_strength[i] + p.torque_offset_nm[i], -limit, limit);
+      lagged_torque_nm_[i] += alpha * (torque - lagged_torque_nm_[i]);
+      torque = lagged_torque_nm_[i];
       if (g_config.torque_speed_limit) {
         const double wheel_vel = data->qvel[model->jnt_dofadr[wheel_joint_ids_[i]]];
         torque = limitByTorqueSpeedEnvelope(torque, wheel_vel);
       }
-      applied_torque_nm_[i] = clamp(torque, -g_config.torque_limit_nm, g_config.torque_limit_nm);
+      applied_torque_nm_[i] = clamp(torque, -limit, limit);
       data->ctrl[actuator_ids_[i]] = applied_torque_nm_[i];
+    }
+  }
+
+  // Samples the true sensor values after every physics step, for the sensor delays.
+  void recordSensors() {
+    if (!initialized_ || !g_model || !g_data) {
+      return;
+    }
+    syncTime(g_data->time);
+    sensor_history_.push_back(trueSensorSample());
+    while (!sensor_history_.empty() &&
+           sensor_history_.front().time < g_data->time - kSensorHistorySec) {
+      sensor_history_.pop_front();
     }
   }
 
@@ -518,22 +762,13 @@ class OmniwheelRosBridge : public rclcpp::Node {
     }
 
     const auto stamp = stampFromSimTime(g_data->time);
+    const SensedState sensed = senseState();
 
     const int base_qpos = g_model->jnt_qposadr[base_freejoint_id_];
-    const int base_qvel = g_model->jnt_dofadr[base_freejoint_id_];
-
     const double x = g_data->qpos[base_qpos + 0];
     const double y = g_data->qpos[base_qpos + 1];
     const double yaw = yawFromMujocoQuat(&g_data->qpos[base_qpos + 3]);
     const auto odom_quat = yawQuaternion(yaw);
-
-    const double vx_world = g_data->qvel[base_qvel + 0];
-    const double vy_world = g_data->qvel[base_qvel + 1];
-    const double yaw_rate = g_data->qvel[base_qvel + 5];
-    const double cos_yaw = std::cos(yaw);
-    const double sin_yaw = std::sin(yaw);
-    const double vx_body = cos_yaw * vx_world + sin_yaw * vy_world;
-    const double vy_body = -sin_yaw * vx_world + cos_yaw * vy_world;
 
     geometry_msgs::msg::TransformStamped tf_msg;
     tf_msg.header.stamp = stamp;
@@ -559,16 +794,121 @@ class OmniwheelRosBridge : public rclcpp::Node {
     odom_msg.pose.pose.orientation.y = odom_quat[1];
     odom_msg.pose.pose.orientation.z = odom_quat[2];
     odom_msg.pose.pose.orientation.w = odom_quat[3];
-    odom_msg.twist.twist.linear.x = vx_body;
-    odom_msg.twist.twist.linear.y = vy_body;
-    odom_msg.twist.twist.angular.z = yaw_rate;
+    odom_msg.twist.twist.linear.x = sensed.base_vel[0];
+    odom_msg.twist.twist.linear.y = sensed.base_vel[1];
+    odom_msg.twist.twist.angular.z = sensed.base_vel[2];
     setDiagonalCovariance(odom_msg.pose.covariance, 1e-4, 1e-4, 1.0, 1.0, 1.0, 1e-4);
     setDiagonalCovariance(odom_msg.twist.covariance, 1e-3, 1e-3, 1.0, 1.0, 1.0, 1e-3);
     odom_pub_->publish(odom_msg);
 
     publishWheelOdometry(stamp);
-    publishJointStates(stamp);
-    publishEncoderAngles();
+    publishJointStates(stamp, sensed);
+    publishEncoderAngles(sensed);
+  }
+
+  struct SensorSample {
+    double time{0.0};
+    std::array<double, 2> pendulum_pos{};
+    std::array<double, 2> pendulum_vel{};
+    std::array<double, 3> base_vel{};  // vx, vy in the yaw-aligned base frame, wz
+  };
+
+  struct SensedState {
+    std::array<double, 2> pendulum_pos{};
+    std::array<double, 2> pendulum_vel{};
+    std::array<double, 3> base_vel{};
+  };
+
+  SensorSample trueSensorSample() const {
+    SensorSample sample;
+    sample.time = g_data->time;
+    sample.pendulum_pos = pendulumAngles();
+    sample.pendulum_vel = pendulumVelocities();
+
+    const int base_qpos = g_model->jnt_qposadr[base_freejoint_id_];
+    const int base_qvel = g_model->jnt_dofadr[base_freejoint_id_];
+    const double yaw = yawFromMujocoQuat(&g_data->qpos[base_qpos + 3]);
+    const double vx_world = g_data->qvel[base_qvel + 0];
+    const double vy_world = g_data->qvel[base_qvel + 1];
+    sample.base_vel = {std::cos(yaw) * vx_world + std::sin(yaw) * vy_world,
+                       -std::sin(yaw) * vx_world + std::cos(yaw) * vy_world,
+                       g_data->qvel[base_qvel + 5]};
+    return sample;
+  }
+
+  // Newest recorded sample at least `delay_s` old; the current state if none is.
+  SensorSample delayedSample(double delay_s, const SensorSample& now) const {
+    const double cutoff = now.time - delay_s;
+    for (auto it = sensor_history_.rbegin(); it != sensor_history_.rend(); ++it) {
+      if (it->time <= cutoff) {
+        return *it;
+      }
+    }
+    return sensor_history_.empty() ? now : sensor_history_.front();
+  }
+
+  // The policy's sensor inputs as training corrupts them (observation terms in ft_t7's
+  // env.yaml): a fixed offset, a delay, an occasional repeated sample, then uniform noise. The
+  // pendulum angle and rate share one delay and hold, as in training. Noise and hold are drawn
+  // per published message here rather than per 60 Hz policy step.
+  SensedState senseState() {
+    syncTime(g_data->time);
+    const DomainParams& p = g_params;
+    const SensorSample now = trueSensorSample();
+
+    const SensorSample pend = delayedSample(p.pendulum_delay_ms / 1000.0, now);
+    std::array<double, 4> pend_value = {
+        pend.pendulum_pos[0] + p.pendulum_angle_offset_deg[0] * kDegToRad,
+        pend.pendulum_pos[1] + p.pendulum_angle_offset_deg[1] * kDegToRad,
+        pend.pendulum_vel[0] + p.pendulum_rate_offset_deg_s[0] * kDegToRad,
+        pend.pendulum_vel[1] + p.pendulum_rate_offset_deg_s[1] * kDegToRad};
+    if (have_held_pendulum_ && unit_(sensor_rng_) < p.pendulum_hold_pct / 100.0) {
+      pend_value = held_pendulum_;
+    }
+    held_pendulum_ = pend_value;
+    have_held_pendulum_ = true;
+
+    const SensorSample base = delayedSample(p.base_vel_delay_ms / 1000.0, now);
+    std::array<double, 3> base_value{};
+    for (std::size_t i = 0; i < 3; ++i) {
+      base_value[i] = base.base_vel[i] + p.base_vel_offset[i];
+    }
+    if (have_held_base_vel_ && unit_(sensor_rng_) < p.base_vel_hold_pct / 100.0) {
+      base_value = held_base_vel_;
+    }
+    held_base_vel_ = base_value;
+    have_held_base_vel_ = true;
+
+    const auto noise = [this](double amplitude) {
+      return amplitude * (2.0 * unit_(sensor_rng_) - 1.0);
+    };
+    SensedState sensed;
+    for (std::size_t i = 0; i < 2; ++i) {
+      sensed.pendulum_pos[i] = pend_value[i] + noise(p.pendulum_angle_noise_deg * kDegToRad);
+      sensed.pendulum_vel[i] =
+          pend_value[2 + i] + noise(p.pendulum_rate_noise_deg_s * kDegToRad);
+    }
+    for (std::size_t i = 0; i < 3; ++i) {
+      sensed.base_vel[i] = base_value[i] + noise(p.base_vel_noise);
+    }
+    return sensed;
+  }
+
+  // Sim time going backwards means a reset or reload: drop every delayed or held value.
+  void syncTime(double time) {
+    if (time < last_sim_time_) {
+      resetActuation();
+      sensor_history_.clear();
+      have_held_pendulum_ = false;
+      have_held_base_vel_ = false;
+    }
+    last_sim_time_ = time;
+  }
+
+  void resetActuation() {
+    packet_queue_.clear();
+    held_packet_ = {0.0, 0.0, 0.0};
+    lagged_torque_nm_ = {0.0, 0.0, 0.0};
   }
 
   template <typename CovarianceArray>
@@ -653,11 +993,11 @@ class OmniwheelRosBridge : public rclcpp::Node {
     wheel_odom_pub_->publish(wheel_odom);
   }
 
-  void publishJointStates(const builtin_interfaces::msg::Time& stamp) {
+  void publishJointStates(const builtin_interfaces::msg::Time& stamp, const SensedState& sensed) {
     const auto wheel_pos_lrb = wheelPositionsLeftRightBack();
     const auto wheel_vel_lrb = wheelVelocitiesLeftRightBack();
-    const auto pendulum_pos = pendulumAngles();
-    const auto pendulum_vel = pendulumVelocities();
+    const auto& pendulum_pos = sensed.pendulum_pos;
+    const auto& pendulum_vel = sensed.pendulum_vel;
 
     sensor_msgs::msg::JointState joint_state;
     joint_state.header.stamp = stamp;
@@ -685,7 +1025,7 @@ class OmniwheelRosBridge : public rclcpp::Node {
     joint_state_pub_->publish(joint_state);
   }
 
-  void publishEncoderAngles() {
+  void publishEncoderAngles(const SensedState& sensed) {
     constexpr std::array<std::array<float, 2>, 2> encoder_limits = {
         std::array<float, 2>{0.353988F, 0.705674F},
         std::array<float, 2>{2.261226F, 2.611762F}};
@@ -699,7 +1039,7 @@ class OmniwheelRosBridge : public rclcpp::Node {
     msg.layout.dim[0].label = "encoder_values";
     msg.data.resize(6, 0.0F);
 
-    const auto pendulum_pos = pendulumAngles();
+    const auto& pendulum_pos = sensed.pendulum_pos;
     msg.data[0] = static_cast<float>(pendulum_pos[0]) + zero0;
     msg.data[1] = static_cast<float>(pendulum_pos[1]) + zero1;
     msg.data[2] = encoder_limits[1][0];
@@ -716,11 +1056,34 @@ class OmniwheelRosBridge : public rclcpp::Node {
   int pendulum_ball_joint_id_{-1};
   int base_freejoint_id_{-1};
 
+  static constexpr double kSensorHistorySec = 0.25;  // longer than the longest sensor delay
+
   std::mutex command_mutex_;
-  std::array<double, 3> target_torque_nm_{0.0, 0.0, 0.0};
-  std::array<double, 3> applied_torque_nm_{0.0, 0.0, 0.0};
+  std::array<double, 3> command_wrench_{0.0, 0.0, 0.0};  // fx, fy, tz as received
+  std::uint64_t command_seq_{0};
   std::chrono::steady_clock::time_point last_command_time_{std::chrono::steady_clock::now()};
   bool command_received_{false};
+
+  // Physics-thread actuation state.
+  std::uint64_t last_command_seq_{0};
+  std::array<double, 3> held_packet_{0.0, 0.0, 0.0};
+  std::deque<std::pair<double, std::array<double, 3>>> packet_queue_;  // (sim time, action)
+  std::array<double, 3> lagged_torque_nm_{0.0, 0.0, 0.0};
+  std::array<double, 3> applied_torque_nm_{0.0, 0.0, 0.0};
+  std::mt19937 physics_rng_{std::random_device{}()};
+
+  // Sensor state, shared by the physics thread (recording) and the ROS thread (publishing)
+  // under Simulate::mtx; sensor_rng_ is used only on the ROS thread.
+  double last_sim_time_{0.0};
+  std::deque<SensorSample> sensor_history_;
+  std::array<double, 4> held_pendulum_{};
+  bool have_held_pendulum_{false};
+  std::array<double, 3> held_base_vel_{};
+  bool have_held_base_vel_{false};
+  std::mt19937 sensor_rng_{std::random_device{}()};
+
+  std::normal_distribution<double> gaussian_{0.0, 1.0};
+  std::uniform_real_distribution<double> unit_{0.0, 1.0};
 
   rclcpp::Subscription<geometry_msgs::msg::Wrench>::SharedPtr wrench_sub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
@@ -744,6 +1107,7 @@ void stepPhysics(mjModel* model, mjData* data) {
   mj_step(model, data);
   if (g_bridge) {
     g_bridge->enforceFixedPendulum(model, data, true);
+    g_bridge->recordSensors();
     g_bridge->publishClock(data->time);
   }
 }
@@ -817,6 +1181,7 @@ void PhysicsLoop(mj::Simulate& sim) {
       if (!g_model || !g_data) {
         continue;
       }
+      g_model_randomizer.apply(g_model, g_params);
 
       if (sim.run) {
         bool stepped = false;
@@ -924,78 +1289,137 @@ void userKeyCallback(GLFWwindow* window, int key, int scancode, int act, int mod
   }
 }
 
-// Adds a "Pendulum" section to the viewer's right panel with sliders for the ball joint's
-// cone limit (jnt_range[1]) and damping (dof_damping, same on all 3 DOFs). Simulate rebuilds
-// the right panel on every model load and trims it back to its own sections when it remakes
-// the joint or control section, so the section is re-appended whenever it goes missing.
-// PollEvents runs on the render thread with sim->mtx held and the GL context current, which
-// the mjui calls require.
-class PendulumUiAdapter : public mj::GlfwAdapter {
+// Adds the domain-randomization sliders to the viewer's right panel, bound straight to
+// g_params: Pendulum (the two most-used knobs), Robot physics, Motors and Sensors. Simulate
+// rebuilds the right panel on every model load and trims it back to its own sections when it
+// remakes the joint or control section, so the sections are re-appended whenever they go
+// missing. PollEvents runs on the render thread with sim->mtx held and the GL context current,
+// which the mjui calls require.
+class DomainUiAdapter : public mj::GlfwAdapter {
  public:
   void attach(mj::Simulate* sim) { sim_ = sim; }
 
   void PollEvents() override {
     mj::GlfwAdapter::PollEvents();
-    if (!sim_ || !sim_->m_) {
-      return;
-    }
-
-    if (sim_->m_ != model_) {
-      model_ = sim_->m_;
-      joint_id_ = mj_name2id(model_, mjOBJ_JOINT, "pendulum_ball_joint");
-      if (joint_id_ >= 0) {
-        max_angle_deg_ = model_->jnt_range[2 * joint_id_ + 1] * 180.0 / kPi;
-        applied_deg_ = max_angle_deg_;
-        damping_ = model_->dof_damping[model_->jnt_dofadr[joint_id_]];
-        applied_damping_ = damping_;
-      }
-    }
-    if (joint_id_ < 0) {
-      return;
-    }
-
-    if (!hasSection()) {
-      addSection();
-    }
-    if (max_angle_deg_ != applied_deg_) {
-      model_->jnt_range[2 * joint_id_ + 1] = max_angle_deg_ * kPi / 180.0;
-      applied_deg_ = max_angle_deg_;
-    }
-    if (damping_ != applied_damping_) {
-      const int dof = model_->jnt_dofadr[joint_id_];
-      for (int i = 0; i < 3; ++i) {
-        model_->dof_damping[dof + i] = damping_;
-      }
-      applied_damping_ = damping_;
+    if (sim_ && sim_->m_ && !hasSections()) {
+      addSections();
     }
   }
 
  private:
-  static constexpr const char* kSectionName = "Pendulum";
+  static constexpr int kNumSections = 4;
+  static constexpr const char* kLastSectionName = "Sensors";
 
-  bool hasSection() const {
-    const mjUI& ui = sim_->ui1;
-    return ui.nsect > 0 && std::strcmp(ui.sect[ui.nsect - 1].name, kSectionName) == 0;
+  static mjuiDef section(const char* name) {
+    mjuiDef def{};
+    def.type = mjITEM_SECTION;
+    mju::strcpy_arr(def.name, name);
+    def.state = mjPRESERVE;
+    return def;
   }
 
-  void addSection() {
+  static mjuiDef separator(const char* name) {
+    mjuiDef def{};
+    def.type = mjITEM_SEPARATOR;
+    mju::strcpy_arr(def.name, name);
+    def.state = 1;  // plain, not collapsible
+    return def;
+  }
+
+  // `range` is "min max divisions"; state 2 enables the slider once a model is loaded.
+  static mjuiDef slider(const char* name, mjtNum* value, const char* range) {
+    mjuiDef def{};
+    def.type = mjITEM_SLIDERNUM;
+    mju::strcpy_arr(def.name, name);
+    def.state = 2;
+    def.pdata = value;
+    mju::strcpy_arr(def.other, range);
+    return def;
+  }
+
+  bool hasSections() const {
+    const mjUI& ui = sim_->ui1;
+    return ui.nsect > 0 && std::strcmp(ui.sect[ui.nsect - 1].name, kLastSectionName) == 0;
+  }
+
+  void addSections() {
     mjUI& ui = sim_->ui1;
-    if (ui.nsect >= mjMAXUISECT) {
+    if (ui.nsect + kNumSections > mjMAXUISECT) {
       return;
     }
-    // Open on first appearance; afterwards mjPRESERVE keeps the user's open/closed choice.
+    // Pendulum starts open, the rest collapsed; afterwards mjPRESERVE keeps the user's choice.
     if (!added_once_) {
-      ui.sect[ui.nsect].state = mjSECT_OPEN;
+      for (int i = 0; i < kNumSections; ++i) {
+        ui.sect[ui.nsect + i].state = i == 0 ? mjSECT_OPEN : mjSECT_CLOSED;
+      }
       added_once_ = true;
     }
-    mjuiDef defs[] = {
-        {mjITEM_SECTION, "Pendulum", mjPRESERVE, nullptr, "", 0},
-        {mjITEM_SLIDERNUM, "Max angle (deg)", 2, &max_angle_deg_, "0 10 20", 0},
-        // Starts at the MJCF value; training randomizes over 0-0.05, the slider goes to 2x that.
-        {mjITEM_SLIDERNUM, "Damping (Nms/rad)", 2, &damping_, "0 0.1 20", 0},
-        {mjITEM_END, "", 0, nullptr, "", 0},
+
+    DomainParams& p = g_params;
+    mjuiDef end{};
+    end.type = mjITEM_END;
+    const std::vector<mjuiDef> defs = {
+        section("Pendulum"),
+        slider("Max angle (deg)", &p.pendulum_max_angle_deg, "0 10 20"),
+        slider("Damping", &p.pendulum_damping, "0 0.1 20"),
+
+        section("Robot physics"),
+        separator("Base"),
+        slider("Mass scale", &p.mass_scale, "0.85 1.15 30"),
+        slider("COM x (cm)", &p.com_offset_cm[0], "-2 2 40"),
+        slider("COM y (cm)", &p.com_offset_cm[1], "-2 2 40"),
+        slider("COM z (cm)", &p.com_offset_cm[2], "-1 3 40"),
+        separator("Joint damping"),
+        slider("Rims", &p.rim_damping, "0 0.05 20"),
+        slider("Rollers", &p.roller_damping, "0 0.001 20"),
+        separator("Joint friction"),
+        slider("Pendulum", &p.pendulum_friction, "0 0.02 20"),
+        slider("Rims", &p.rim_friction, "0 0.02 20"),
+        slider("Rollers", &p.roller_friction, "0 0.02 20"),
+        separator("Ground contact"),
+        slider("Friction", &p.ground_friction, "0.4 2.0 32"),
+
+        section("Motors"),
+        separator("Torque strength"),
+        slider("Left", &p.torque_strength[0], "0.8 1.2 40"),
+        slider("Right", &p.torque_strength[1], "0.8 1.2 40"),
+        slider("Back", &p.torque_strength[2], "0.8 1.2 40"),
+        separator("Torque offset (Nm)"),
+        slider("Left", &p.torque_offset_nm[0], "-0.2 0.2 40"),
+        slider("Right", &p.torque_offset_nm[1], "-0.2 0.2 40"),
+        slider("Back", &p.torque_offset_nm[2], "-0.2 0.2 40"),
+        separator("Timing (ms)"),
+        slider("Motor lag", &p.motor_lag_ms, "0 20 20"),
+        slider("Command delay", &p.action_delay_ms, "0 33.3333 20"),
+        separator("Command noise (action units)"),
+        slider("Offset Fx", &p.action_offset[0], "-0.03 0.03 30"),
+        slider("Offset Fy", &p.action_offset[1], "-0.03 0.03 30"),
+        slider("Offset Tz", &p.action_offset[2], "-0.03 0.03 30"),
+        slider("Jitter std", &p.action_jitter_std, "0 0.04 20"),
+        slider("Hold (%)", &p.action_hold_pct, "0 2 20"),
+
+        section(kLastSectionName),
+        separator("Pendulum angle (deg)"),
+        slider("Noise", &p.pendulum_angle_noise_deg, "0 0.7 14"),
+        slider("Offset 1", &p.pendulum_angle_offset_deg[0], "-0.25 0.25 20"),
+        slider("Offset 2", &p.pendulum_angle_offset_deg[1], "-0.25 0.25 20"),
+        separator("Pendulum rate (deg/s)"),
+        slider("Noise", &p.pendulum_rate_noise_deg_s, "0 6 12"),
+        slider("Offset 1", &p.pendulum_rate_offset_deg_s[0], "-1 1 20"),
+        slider("Offset 2", &p.pendulum_rate_offset_deg_s[1], "-1 1 20"),
+        separator("Pendulum timing"),
+        slider("Delay (ms)", &p.pendulum_delay_ms, "0 50 30"),
+        slider("Hold (%)", &p.pendulum_hold_pct, "0 2 20"),
+        separator("Base velocity (m/s, rad/s)"),
+        slider("Noise", &p.base_vel_noise, "0 0.06 12"),
+        slider("Offset vx", &p.base_vel_offset[0], "-0.01 0.01 20"),
+        slider("Offset vy", &p.base_vel_offset[1], "-0.01 0.01 20"),
+        slider("Offset wz", &p.base_vel_offset[2], "-0.01 0.01 20"),
+        slider("Delay (ms)", &p.base_vel_delay_ms, "0 33.3333 20"),
+        slider("Hold (%)", &p.base_vel_hold_pct, "0 1 20"),
+        end,
     };
-    mjui_add(&ui, defs);
+    mjui_add(&ui, defs.data());
 
     // Same steps as simulate's UiModify, which is not exported.
     mjrContext& con = mjr_context();
@@ -1005,12 +1429,6 @@ class PendulumUiAdapter : public mj::GlfwAdapter {
   }
 
   mj::Simulate* sim_ = nullptr;
-  const mjModel* model_ = nullptr;
-  int joint_id_ = -1;
-  mjtNum max_angle_deg_ = 0;
-  mjtNum applied_deg_ = 0;
-  mjtNum damping_ = 0;
-  mjtNum applied_damping_ = 0;
   bool added_once_ = false;
 };
 
@@ -1036,10 +1454,10 @@ int main(int argc, char** argv) {
   mjvPerturb pert;
   mjv_defaultPerturb(&pert);
 
-  auto ui_adapter = std::make_unique<PendulumUiAdapter>();
-  PendulumUiAdapter* pendulum_ui = ui_adapter.get();
+  auto ui_adapter = std::make_unique<DomainUiAdapter>();
+  DomainUiAdapter* domain_ui = ui_adapter.get();
   auto sim = std::make_unique<mj::Simulate>(std::move(ui_adapter), &cam, &opt, &pert, false);
-  pendulum_ui->attach(sim.get());
+  domain_ui->attach(sim.get());
   sim->run = 0;  // start paused; press space to run
 
   g_bridge = std::make_shared<OmniwheelRosBridge>(sim.get());
