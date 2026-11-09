@@ -1,6 +1,7 @@
 FROM ros:humble
 
 ENV DEBIAN_FRONTEND=noninteractive
+ENV ROS_DOMAIN_ID=42
 ENV RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
 ENV CYCLONEDDS_URI=file:///workspace/omniwheel_mujoco/cyclonedds.xml
 
