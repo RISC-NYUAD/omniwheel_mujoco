@@ -924,6 +924,96 @@ void userKeyCallback(GLFWwindow* window, int key, int scancode, int act, int mod
   }
 }
 
+// Adds a "Pendulum" section to the viewer's right panel with sliders for the ball joint's
+// cone limit (jnt_range[1]) and damping (dof_damping, same on all 3 DOFs). Simulate rebuilds
+// the right panel on every model load and trims it back to its own sections when it remakes
+// the joint or control section, so the section is re-appended whenever it goes missing.
+// PollEvents runs on the render thread with sim->mtx held and the GL context current, which
+// the mjui calls require.
+class PendulumUiAdapter : public mj::GlfwAdapter {
+ public:
+  void attach(mj::Simulate* sim) { sim_ = sim; }
+
+  void PollEvents() override {
+    mj::GlfwAdapter::PollEvents();
+    if (!sim_ || !sim_->m_) {
+      return;
+    }
+
+    if (sim_->m_ != model_) {
+      model_ = sim_->m_;
+      joint_id_ = mj_name2id(model_, mjOBJ_JOINT, "pendulum_ball_joint");
+      if (joint_id_ >= 0) {
+        max_angle_deg_ = model_->jnt_range[2 * joint_id_ + 1] * 180.0 / kPi;
+        applied_deg_ = max_angle_deg_;
+        damping_ = model_->dof_damping[model_->jnt_dofadr[joint_id_]];
+        applied_damping_ = damping_;
+      }
+    }
+    if (joint_id_ < 0) {
+      return;
+    }
+
+    if (!hasSection()) {
+      addSection();
+    }
+    if (max_angle_deg_ != applied_deg_) {
+      model_->jnt_range[2 * joint_id_ + 1] = max_angle_deg_ * kPi / 180.0;
+      applied_deg_ = max_angle_deg_;
+    }
+    if (damping_ != applied_damping_) {
+      const int dof = model_->jnt_dofadr[joint_id_];
+      for (int i = 0; i < 3; ++i) {
+        model_->dof_damping[dof + i] = damping_;
+      }
+      applied_damping_ = damping_;
+    }
+  }
+
+ private:
+  static constexpr const char* kSectionName = "Pendulum";
+
+  bool hasSection() const {
+    const mjUI& ui = sim_->ui1;
+    return ui.nsect > 0 && std::strcmp(ui.sect[ui.nsect - 1].name, kSectionName) == 0;
+  }
+
+  void addSection() {
+    mjUI& ui = sim_->ui1;
+    if (ui.nsect >= mjMAXUISECT) {
+      return;
+    }
+    // Open on first appearance; afterwards mjPRESERVE keeps the user's open/closed choice.
+    if (!added_once_) {
+      ui.sect[ui.nsect].state = mjSECT_OPEN;
+      added_once_ = true;
+    }
+    mjuiDef defs[] = {
+        {mjITEM_SECTION, "Pendulum", mjPRESERVE, nullptr, "", 0},
+        {mjITEM_SLIDERNUM, "Max angle (deg)", 2, &max_angle_deg_, "0 10 20", 0},
+        // Starts at the MJCF value; training randomizes over 0-0.05, the slider goes to 2x that.
+        {mjITEM_SLIDERNUM, "Damping (Nms/rad)", 2, &damping_, "0 0.1 20", 0},
+        {mjITEM_END, "", 0, nullptr, "", 0},
+    };
+    mjui_add(&ui, defs);
+
+    // Same steps as simulate's UiModify, which is not exported.
+    mjrContext& con = mjr_context();
+    mjui_resize(&ui, &con);
+    mjr_addAux(ui.auxid, ui.width, ui.maxheight, ui.spacing.samples, &con);
+    mjui_update(-1, -1, &ui, &sim_->uistate, &con);
+  }
+
+  mj::Simulate* sim_ = nullptr;
+  const mjModel* model_ = nullptr;
+  int joint_id_ = -1;
+  mjtNum max_angle_deg_ = 0;
+  mjtNum applied_deg_ = 0;
+  mjtNum damping_ = 0;
+  mjtNum applied_damping_ = 0;
+  bool added_once_ = false;
+};
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -946,8 +1036,10 @@ int main(int argc, char** argv) {
   mjvPerturb pert;
   mjv_defaultPerturb(&pert);
 
-  auto sim = std::make_unique<mj::Simulate>(
-      std::make_unique<mj::GlfwAdapter>(), &cam, &opt, &pert, false);
+  auto ui_adapter = std::make_unique<PendulumUiAdapter>();
+  PendulumUiAdapter* pendulum_ui = ui_adapter.get();
+  auto sim = std::make_unique<mj::Simulate>(std::move(ui_adapter), &cam, &opt, &pert, false);
+  pendulum_ui->attach(sim.get());
   sim->run = 0;  // start paused; press space to run
 
   g_bridge = std::make_shared<OmniwheelRosBridge>(sim.get());

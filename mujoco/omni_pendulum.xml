@@ -701,7 +701,7 @@
       </body>
       <body name="pendulum_link1" pos="0 0 0.48833" quat="0 0 0.707107 0.707107">
         <inertial pos="0.00059893 -2.2335e-05 8.086e-08" quat="0.499787 0.499801 0.500206 0.500206" mass="0.019711" diaginertia="1.7958e-06 1.5161e-06 1.1938e-06" />
-        <joint name="pendulum_ball_joint" type="ball" pos="0 0 0" limited="true" range="0 0.174533" />
+        <joint name="pendulum_ball_joint" type="ball" pos="0 0 0" limited="true" range="0 0.174533" damping="0.05" />
         <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.071 0.91 0.816 1" mesh="pendulum_link1" />
         <geom type="mesh" rgba="0.071 0.91 0.816 1" mesh="pendulum_link1" contype="1" conaffinity="0" />
         <body name="pendulum_link2" quat="0.5 -0.5 0.5 -0.5">
